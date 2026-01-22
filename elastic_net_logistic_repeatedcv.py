@@ -8,6 +8,7 @@ from sklearn.model_selection import RepeatedStratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegressionCV
+from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     roc_auc_score,
     balanced_accuracy_score,
@@ -18,25 +19,24 @@ from sklearn.metrics import (
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Elastic Net Logistic Regression (glmnet-style) for marker genes using nested repeated CV."
+        description="Elastic Net Logistic Regression (glmnet-style) marker gene discovery with nested repeated CV."
     )
     p.add_argument("--input", required=True,
-                   help="TSV file: sample + OG presence/absence + target column (e.g., biomarkers_three_classes.tsv)")
-    p.add_argument("--outdir", required=True, help="Output directory")
-    p.add_argument("--id_col", required=True, help="Sample ID column name (e.g., sample)")
-    p.add_argument("--targets_col", required=True, help="Target/category column name (e.g., target_column)")
+                   help="TSV file containing sample + OG columns + targets column.")
+    p.add_argument("--outdir", required=True, help="Output directory.")
+    p.add_argument("--id_col", required=True, help="Sample ID column name (e.g., sample).")
+    p.add_argument("--targets_col", required=True, help="Target column name (e.g., target_column).")
     p.add_argument("--toi", required=True,
-                   help="Target of interest label (positive class), e.g. level_1 or level_2 or level_3")
+                   help="Target-of-interest label for POSITIVE class (e.g., level_2 for Low SCC).")
 
     # Outer CV settings
-    p.add_argument("--outer_splits", type=int, default=5, help="Outer folds (default 5)")
-    p.add_argument("--outer_repeats", type=int, default=20, help="Outer repeats (default 20)")
-    p.add_argument("--seed", type=int, default=42, help="Random seed")
+    p.add_argument("--outer_splits", type=int, default=5, help="Outer folds (default 5).")
+    p.add_argument("--outer_repeats", type=int, default=20, help="Outer repeats (default 20).")
+    p.add_argument("--seed", type=int, default=42, help="Random seed.")
 
-    # Inner CV settings for LogisticRegressionCV
-    p.add_argument("--inner_cv", type=int, default=5, help="Inner folds (default 5)")
-    p.add_argument("--Cs", type=int, default=20,
-                   help="Number of inverse-regularization values (C grid size) (default 20)")
+    # Inner CV settings
+    p.add_argument("--inner_cv", type=int, default=5, help="Inner folds (default 5).")
+    p.add_argument("--Cs", type=int, default=20, help="Number of C values to try (default 20).")
 
     # Optional filtering
     p.add_argument("--drop_class", action="append", default=[],
@@ -47,11 +47,17 @@ def parse_args():
 
 
 def to01_series(x: pd.Series) -> pd.Series:
-    """Convert mixed input to strict 0/1 integers; NA -> 0."""
+    """
+    Convert mixed-type OG presence/absence values to strict 0/1 int.
+    Any unknown/NA becomes 0.
+    """
     x = x.astype(str)
+
     x = np.where(np.isin(x, ["1", "TRUE", "T", "True", "true"]), 1,
                  np.where(np.isin(x, ["0", "FALSE", "F", "False", "false"]), 0, np.nan))
-    x = pd.Series(x).astype("float").fillna(0).astype(int)
+
+    x = pd.Series(x).astype("float")
+    x = x.fillna(0).astype(int)
     return x
 
 
@@ -66,9 +72,9 @@ def main():
 
     for col in [args.id_col, args.targets_col]:
         if col not in df.columns:
-            raise ValueError(f"Column '{col}' not found in input file.")
+            raise ValueError(f"Column '{col}' not found in input.")
 
-    # Optional: drop one or more classes (e.g. remove Middle SCC)
+    # Optional: drop class(es)
     if args.drop_class:
         df = df[~df[args.targets_col].isin(args.drop_class)].copy()
 
@@ -81,14 +87,23 @@ def main():
     if n_pos < 5 or n_neg < 5:
         raise ValueError(f"Too few samples for classification: positives={n_pos}, negatives={n_neg}.")
 
-    # OG columns
+    # OG columns (expected to start with OG)
     og_cols = [c for c in df.columns if c.startswith("OG")]
     if len(og_cols) == 0:
         raise ValueError("No OG columns found (expected columns starting with 'OG').")
 
+    # Build X and force 0/1
     X = df[og_cols].copy()
     for c in og_cols:
         X[c] = to01_series(X[c])
+
+    # Global safety: coerce all to numeric and kill NaNs
+    X = X.apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
+
+    # Final debug check
+    nan_count = int(X.isna().sum().sum())
+    if nan_count > 0:
+        raise ValueError(f"Still found NaN in X after cleaning: total NaNs = {nan_count}")
 
     sample_ids = df[args.id_col].astype(str).to_numpy()
 
@@ -101,13 +116,12 @@ def main():
         random_state=args.seed
     )
 
-    # Marker stability counter
     selected_counts = pd.Series(0, index=og_cols, dtype=int)
-
     fold_rows = []
     pred_rows = []
 
     fold_idx = 0
+
     for train_idx, test_idx in outer_cv.split(X, y):
         fold_idx += 1
 
@@ -117,12 +131,11 @@ def main():
         y_test = y[test_idx]
 
         # -----------------------------
-        # Inner CV for hyperparameters (glmnet-style)
-        # LogisticRegressionCV chooses best C and l1_ratio
+        # Pipeline (impute -> scale -> elasticnet logistic CV)
         # -----------------------------
-        # NOTE: saga solver is required for elasticnet penalty
         model = Pipeline(steps=[
-            # Scaling is fine even for 0/1 features; helps optimizer
+            # Even though X should already be finite, keep this to be safe
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0)),
             ("scaler", StandardScaler(with_mean=True, with_std=True)),
             ("clf", LogisticRegressionCV(
                 penalty="elasticnet",
@@ -132,7 +145,7 @@ def main():
                 Cs=args.Cs,
                 l1_ratios=[0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 0.95],
                 max_iter=20000,
-                n_jobs=1,             # safer on HPC nodes; increase if needed
+                n_jobs=1,
                 refit=True,
                 class_weight="balanced",
                 random_state=args.seed
@@ -143,7 +156,7 @@ def main():
 
         clf = model.named_steps["clf"]
 
-        # predicted probabilities for AUC
+        # Probs for AUC
         y_prob = model.predict_proba(X_test)[:, 1]
         y_pred = (y_prob >= 0.5).astype(int)
 
@@ -154,8 +167,7 @@ def main():
 
         tn, fp, fn, tp = confusion_matrix(y_test, y_pred, labels=[0, 1]).ravel()
 
-        # Best params chosen inside inner CV
-        # C_ and l1_ratio_ can be arrays; extract first value
+        # best hyper-params (may be arrays)
         best_C = float(np.array(clf.C_).ravel()[0])
         best_l1 = float(np.array(clf.l1_ratio_).ravel()[0])
 
@@ -173,10 +185,10 @@ def main():
             "TP": int(tp),
             "FP": int(fp),
             "TN": int(tn),
-            "FN": int(fn),
+            "FN": int(fn)
         })
 
-        # Save predictions for this fold
+        # Save predictions
         for sid, yt, yp, pr in zip(sample_ids[test_idx], y_test, y_pred, y_prob):
             pred_rows.append({
                 args.id_col: sid,
@@ -194,16 +206,16 @@ def main():
     folds_df = pd.DataFrame(fold_rows)
     preds_df = pd.DataFrame(pred_rows)
 
-    # Average per-sample probability (a stable summary across repeats)
+    # Average predicted probability per sample (stable summary)
     preds_summary = preds_df.groupby(args.id_col, as_index=False).agg(
         y_true=("y_true", "mean"),
         y_prob_mean=("y_prob", "mean"),
         y_prob_sd=("y_prob", "std"),
-        n_predictions=("y_prob", "count"),
+        n_predictions=("y_prob", "count")
     )
     preds_summary["y_pred_mean"] = (preds_summary["y_prob_mean"] >= 0.5).astype(int)
 
-    # Overall performance using per-sample mean probabilities
+    # Overall performance based on per-sample mean probability
     overall_auc = roc_auc_score(preds_summary["y_true"], preds_summary["y_prob_mean"])
     overall_balacc = balanced_accuracy_score(preds_summary["y_true"], preds_summary["y_pred_mean"])
     overall_mcc = matthews_corrcoef(preds_summary["y_true"], preds_summary["y_pred_mean"])
@@ -225,18 +237,18 @@ def main():
     preds_path = os.path.join(args.outdir, "outerCV_predictions_all.tsv")
     preds_summary_path = os.path.join(args.outdir, "outerCV_predictions_summary.tsv")
     stability_path = os.path.join(args.outdir, "elastic_net_logistic_marker_stability.tsv")
+    summary_path = os.path.join(args.outdir, "elastic_net_logistic_repeatedCV_summary.txt")
 
     folds_df.to_csv(folds_path, sep="\t", index=False)
     preds_df.to_csv(preds_path, sep="\t", index=False)
     preds_summary.to_csv(preds_summary_path, sep="\t", index=False)
     stability.to_csv(stability_path, sep="\t", index=False)
 
-    # Human-readable summary
-    summary_path = os.path.join(args.outdir, "elastic_net_logistic_repeatedCV_summary.txt")
     with open(summary_path, "w") as f:
         f.write("Elastic Net Logistic Regression (glmnet-style) with repeated nested CV\n")
         f.write("===============================================================\n\n")
         f.write(f"Input: {args.input}\n")
+        f.write(f"Targets column: {args.targets_col}\n")
         f.write(f"TOI (positive class): {args.toi}\n")
         f.write(f"Dropped classes: {args.drop_class}\n\n")
         f.write(f"N samples: {n_total} (pos={n_pos}, neg={n_neg})\n")
