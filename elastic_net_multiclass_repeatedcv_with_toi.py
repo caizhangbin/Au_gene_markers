@@ -3,6 +3,7 @@ import argparse
 import os
 import numpy as np
 import pandas as pd
+import inspect
 
 from sklearn.model_selection import RepeatedStratifiedKFold
 from sklearn.pipeline import Pipeline
@@ -50,6 +51,37 @@ def to01_series(x: pd.Series) -> pd.Series:
     return pd.Series(x).astype(float).fillna(0).astype(int)
 
 
+def build_logregcv_kwargs(args):
+    """
+    Build kwargs for LogisticRegressionCV, only including parameters supported by the installed sklearn version.
+    This avoids crashes due to API differences (like multi_class removed).
+    """
+    sig = inspect.signature(LogisticRegressionCV)
+    supported = set(sig.parameters.keys())
+
+    base_kwargs = dict(
+        penalty="elasticnet",
+        solver="saga",
+        scoring="neg_log_loss",      # good for multiclass
+        cv=args.inner_cv,
+        Cs=args.Cs,
+        l1_ratios=[0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 0.95],
+        max_iter=30000,
+        n_jobs=1,
+        refit=True,
+        class_weight="balanced",
+        random_state=args.seed
+    )
+
+    # Only add multi_class if it exists in this sklearn version
+    # If not present, sklearn will automatically handle multiclass using appropriate strategy.
+    if "multi_class" in supported:
+        base_kwargs["multi_class"] = "multinomial"
+
+    # Some versions support use_legacy_attributes; we do NOT need to set it
+    return {k: v for k, v in base_kwargs.items() if k in supported}
+
+
 def main():
     args = parse_args()
     os.makedirs(args.outdir, exist_ok=True)
@@ -64,7 +96,7 @@ def main():
     if args.keep_class:
         df = df[df[args.targets_col].isin(args.keep_class)].copy()
 
-    # Encode targets (level_1/level_2/level_3 -> 0/1/2)
+    # Encode targets
     y_raw = df[args.targets_col].astype(str).to_numpy()
     le = LabelEncoder()
     y = le.fit_transform(y_raw)
@@ -73,7 +105,7 @@ def main():
     if len(classes) < 3:
         raise ValueError(f"Need 3 classes for multinomial run, found {len(classes)}: {list(le.classes_)}")
 
-    # Resolve TOI encoded index (optional)
+    # Resolve TOI index (optional)
     toi_idx = None
     toi_label = None
     if args.toi is not None:
@@ -92,26 +124,25 @@ def main():
         X[c] = to01_series(X[c])
 
     X = X.apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
-
     sample_ids = df[args.id_col].astype(str).to_numpy()
 
-    # Outer CV
     outer_cv = RepeatedStratifiedKFold(
         n_splits=args.outer_splits,
         n_repeats=args.outer_repeats,
         random_state=args.seed
     )
 
-    # Stability counter: selected if ANY class coef != 0
     selected_counts_any = pd.Series(0, index=og_cols, dtype=int)
 
-    # TOI-specific stability & coefficient aggregation (only if --toi provided)
+    # TOI-specific aggregation
     selected_counts_toi = pd.Series(0, index=og_cols, dtype=int)
     coef_sum_toi = pd.Series(0.0, index=og_cols)
     coef_n_toi = pd.Series(0, index=og_cols, dtype=int)
 
     fold_rows = []
     pred_rows = []
+
+    logreg_kwargs = build_logregcv_kwargs(args)
 
     fold_idx = 0
     for train_idx, test_idx in outer_cv.split(X, y):
@@ -125,35 +156,19 @@ def main():
         model = Pipeline(steps=[
             ("imputer", SimpleImputer(strategy="constant", fill_value=0)),
             ("scaler", StandardScaler(with_mean=True, with_std=True)),
-            ("clf", LogisticRegressionCV(
-                penalty="elasticnet",
-                solver="saga",
-                multi_class="multinomial",
-                scoring="neg_log_loss",      # good for multiclass
-                cv=args.inner_cv,
-                Cs=args.Cs,
-                l1_ratios=[0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 0.95],
-                max_iter=30000,
-                n_jobs=1,
-                refit=True,
-                class_weight="balanced",
-                random_state=args.seed
-            ))
+            ("clf", LogisticRegressionCV(**logreg_kwargs))
         ])
 
         model.fit(X_train, y_train)
-
         clf = model.named_steps["clf"]
 
-        # Predictions
-        proba = model.predict_proba(X_test)              # (n_test, n_classes)
+        proba = model.predict_proba(X_test)   # shape (n_test, n_classes)
         y_pred = np.argmax(proba, axis=1)
 
-        # Metrics
         balacc = balanced_accuracy_score(y_test, y_pred)
         f1mac  = f1_score(y_test, y_pred, average="macro")
 
-        # Multiclass AUC (macro OVR) can fail if fold lacks a class
+        # Macro AUC (OVR) only valid if fold contains all classes
         auc_macro = np.nan
         if len(np.unique(y_test)) == len(le.classes_):
             auc_macro = roc_auc_score(y_test, proba, multi_class="ovr", average="macro")
@@ -166,29 +181,24 @@ def main():
             "macro_F1": float(f1mac),
             "macro_AUC_ovr": float(auc_macro) if not np.isnan(auc_macro) else np.nan,
             "best_C": float(np.array(clf.C_).ravel()[0]),
-            "best_l1_ratio": float(np.array(clf.l1_ratio_).ravel()[0]),
+            "best_l1_ratio": float(np.array(clf.l1_ratio_).ravel()[0]) if hasattr(clf, "l1_ratio_") else np.nan,
         })
 
-        # Save fold predictions (for plotting)
+        # Save fold predictions
         for sid, yt, yp, pr in zip(sample_ids[test_idx], y_test, y_pred, proba):
-            row = {
-                args.id_col: sid,
-                "y_true": int(yt),
-                "y_pred": int(yp),
-                "fold": fold_idx
-            }
+            row = {args.id_col: sid, "y_true": int(yt), "y_pred": int(yp), "fold": fold_idx}
             for i, lab in enumerate(le.classes_):
                 row[f"prob_{lab}"] = float(pr[i])
             pred_rows.append(row)
 
-        # Marker stability: any nonzero coef across classes
+        # Marker stability across ANY class
         coef_df = pd.DataFrame(clf.coef_, columns=og_cols)  # rows=classes, cols=features
         selected_any = coef_df.columns[(coef_df != 0).any(axis=0)]
         selected_counts_any.loc[selected_any] += 1
 
-        # TOI marker stability + direction (optional)
+        # TOI marker stability + direction
         if toi_idx is not None:
-            toi_coef = coef_df.iloc[toi_idx, :]  # Series, coef for TOI class
+            toi_coef = coef_df.iloc[toi_idx, :]  # coefficients for TOI class
             selected_toi = toi_coef.index[toi_coef != 0]
             selected_counts_toi.loc[selected_toi] += 1
             coef_sum_toi.loc[selected_toi] += toi_coef.loc[selected_toi].astype(float)
@@ -207,24 +217,20 @@ def main():
         .rename(columns={"index": "Orthogroup"})
     )
 
-    # TOI-focused marker table (only if --toi provided)
-    stability_toi = None
+    # TOI table
+    toi_markers_path = None
     if toi_idx is not None:
         mean_coef_selected = pd.Series(np.nan, index=og_cols)
         mask = coef_n_toi > 0
         mean_coef_selected.loc[mask] = coef_sum_toi.loc[mask] / coef_n_toi.loc[mask]
 
-        stability_toi = (
-            pd.DataFrame({
-                "Orthogroup": og_cols,
-                "n_selected_toi": selected_counts_toi.values,
-                "selection_rate_toi": (selected_counts_toi.values / total_fits),
-                "mean_coef_toi_selectedFits": mean_coef_selected.values
-            })
-            .sort_values(["selection_rate_toi", "n_selected_toi"], ascending=False)
-        )
+        stability_toi = pd.DataFrame({
+            "Orthogroup": og_cols,
+            "n_selected_toi": selected_counts_toi.values,
+            "selection_rate_toi": (selected_counts_toi.values / total_fits),
+            "mean_coef_toi_selectedFits": mean_coef_selected.values
+        }).sort_values(["selection_rate_toi", "n_selected_toi"], ascending=False)
 
-        # Add direction label
         stability_toi["direction_in_TOI"] = np.where(
             stability_toi["mean_coef_toi_selectedFits"] > 0, "enriched_in_TOI",
             np.where(stability_toi["mean_coef_toi_selectedFits"] < 0, "depleted_in_TOI", "NA")
@@ -241,21 +247,16 @@ def main():
     preds_df.to_csv(preds_path, sep="\t", index=False)
     stability_any.to_csv(stability_any_path, sep="\t", index=False)
 
-    # Save mapping back to original labels
     map_df = pd.DataFrame({"encoded_class": np.arange(len(le.classes_)), "label": le.classes_})
     map_df.to_csv(class_map_path, sep="\t", index=False)
 
-    # Save TOI marker table if requested
-    toi_markers_path = None
-    if stability_toi is not None:
-        toi_markers_path = os.path.join(
-            args.outdir, f"elastic_net_multiclass_marker_stability_TOI_{toi_label}.tsv"
-        )
+    if toi_idx is not None:
+        toi_markers_path = os.path.join(args.outdir, f"elastic_net_multiclass_marker_stability_TOI_{toi_label}.tsv")
         stability_toi.to_csv(toi_markers_path, sep="\t", index=False)
 
-    # Write summary
+    # Summary
     with open(summary_path, "w") as f:
-        f.write("Multinomial Elastic Net Logistic Regression (3-class) with nested repeated CV\n")
+        f.write("Multiclass Elastic Net Logistic Regression (3-class) with nested repeated CV\n")
         f.write("====================================================================\n\n")
         f.write(f"Input: {args.input}\n")
         f.write(f"Targets col: {args.targets_col}\n")
@@ -281,7 +282,7 @@ def main():
         f.write(stability_any.head(20).to_string(index=False))
         f.write("\n")
 
-        if stability_toi is not None:
+        if toi_idx is not None:
             f.write(f"\nTop stable markers for TOI={toi_label} (first 20):\n")
             f.write(stability_toi.head(20).to_string(index=False))
             f.write("\n")
