@@ -1,7 +1,5 @@
 # Au_gene_markers
 
-```markdown
-# Au_gene_markers
 
 Marker discovery pipeline for **Aerococcus urinaeequi (Au)** using **orthogroup (OG) presence/absence** to study associations with **somatic cell count (SCC)**.  
 This repo contains scripts to run:
