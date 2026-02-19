@@ -1,7 +1,7 @@
 # Au_gene_markers
 
 
-Marker discovery pipeline for **Aerococcus urinaeequi (Au)** using **orthogroup (OG) presence/absence** to study associations with **somatic cell count (SCC)**.  
+Marker discovery pipeline for **_Aerococcus urinaeequi_ (Au)** using **orthogroup (OG) presence/absence** to study associations with **somatic cell count (SCC)**.  
 This repo contains scripts to run:
 
 - **Random Forest (RF) biomarker pipeline** (supervised labels + unsupervised RF-proximity clustering)
