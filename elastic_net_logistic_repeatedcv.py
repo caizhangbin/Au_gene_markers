@@ -117,15 +117,15 @@ def main():
     )
 
     selected_counts = pd.Series(0, index=og_cols, dtype=int)
-# coefficient accumulators across outer fits
-coef_sum = pd.Series(0.0, index=og_cols)
-coef_abs_sum = pd.Series(0.0, index=og_cols)
-coef_sum_selected = pd.Series(0.0, index=og_cols)
-pos_selected_counts = pd.Series(0, index=og_cols, dtype=int)
-neg_selected_counts = pd.Series(0, index=og_cols, dtype=int)
+    # coefficient accumulators across outer fits
+    coef_sum = pd.Series(0.0, index=og_cols)
+    coef_abs_sum = pd.Series(0.0, index=og_cols)
+    coef_sum_selected = pd.Series(0.0, index=og_cols)
+    pos_selected_counts = pd.Series(0, index=og_cols, dtype=int)
+    neg_selected_counts = pd.Series(0, index=og_cols, dtype=int)
 
-fold_rows = []
-pred_rows = []
+    fold_rows = []
+    pred_rows = []
 
     fold_idx = 0
 
@@ -207,15 +207,15 @@ pred_rows = []
 
         # Marker selection: non-zero coefficients
         coef = pd.Series(clf.coef_.ravel(), index=og_cols)
-# accumulate coefficient summaries
-coef_sum += coef
-coef_abs_sum += coef.abs()
+        # accumulate coefficient summaries
+        coef_sum += coef
+        coef_abs_sum += coef.abs()
 
-selected = coef[coef != 0]
-selected_counts.loc[selected.index] += 1
-coef_sum_selected.loc[selected.index] += selected
-pos_selected_counts.loc[selected[selected > 0].index] += 1
-neg_selected_counts.loc[selected[selected < 0].index] += 1
+        selected = coef[coef != 0]
+        selected_counts.loc[selected.index] += 1
+        coef_sum_selected.loc[selected.index] += selected
+        pos_selected_counts.loc[selected[selected > 0].index] += 1
+        neg_selected_counts.loc[selected[selected < 0].index] += 1
 
     folds_df = pd.DataFrame(fold_rows)
     preds_df = pd.DataFrame(pred_rows)
@@ -237,31 +237,31 @@ neg_selected_counts.loc[selected[selected < 0].index] += 1
     # Marker stability table
     total_fits = args.outer_splits * args.outer_repeats
     stability = (
-    selected_counts.to_frame("n_selected")
-    .assign(
-        selection_rate=lambda d: d["n_selected"] / total_fits,
-        mean_coef=lambda d: (coef_sum / total_fits).values,
-        mean_abs_coef=lambda d: (coef_abs_sum / total_fits).values,
-        mean_coef_selected=lambda d: np.where(
-            d["n_selected"].to_numpy() > 0,
-            (coef_sum_selected / d["n_selected"]).to_numpy(),
-            np.nan
-        ),
-        pos_rate_selected=lambda d: np.where(
-            d["n_selected"].to_numpy() > 0,
-            (pos_selected_counts / d["n_selected"]).to_numpy(),
-            np.nan
-        ),
-        neg_rate_selected=lambda d: np.where(
-            d["n_selected"].to_numpy() > 0,
-            (neg_selected_counts / d["n_selected"]).to_numpy(),
-            np.nan
+        selected_counts.to_frame("n_selected")
+        .assign(
+            selection_rate=lambda d: d["n_selected"] / total_fits,
+            mean_coef=lambda d: (coef_sum / total_fits).values,
+            mean_abs_coef=lambda d: (coef_abs_sum / total_fits).values,
+            mean_coef_selected=lambda d: np.where(
+                d["n_selected"].to_numpy() > 0,
+                (coef_sum_selected / d["n_selected"]).to_numpy(),
+                np.nan,
+            ),
+            pos_rate_selected=lambda d: np.where(
+                d["n_selected"].to_numpy() > 0,
+                (pos_selected_counts / d["n_selected"]).to_numpy(),
+                np.nan,
+            ),
+            neg_rate_selected=lambda d: np.where(
+                d["n_selected"].to_numpy() > 0,
+                (neg_selected_counts / d["n_selected"]).to_numpy(),
+                np.nan,
+            ),
         )
+        .sort_values(["selection_rate", "n_selected"], ascending=False)
+        .reset_index()
+        .rename(columns={"index": "Orthogroup"})
     )
-    .sort_values(["selection_rate", "n_selected"], ascending=False)
-    .reset_index()
-    .rename(columns={"index": "Orthogroup"})
-)
 
     # -----------------------------
     # Save outputs
@@ -270,14 +270,14 @@ neg_selected_counts.loc[selected[selected < 0].index] += 1
     preds_path = os.path.join(args.outdir, "outerCV_predictions_all.tsv")
     preds_summary_path = os.path.join(args.outdir, "outerCV_predictions_summary.tsv")
     stability_path = os.path.join(args.outdir, "elastic_net_logistic_marker_stability.tsv")
-stability_coef_path = os.path.join(args.outdir, "elastic_net_logistic_marker_stability_with_coef.tsv")
+    stability_coef_path = os.path.join(args.outdir, "elastic_net_logistic_marker_stability_with_coef.tsv")
     summary_path = os.path.join(args.outdir, "elastic_net_logistic_repeatedCV_summary.txt")
 
     folds_df.to_csv(folds_path, sep="\t", index=False)
     preds_df.to_csv(preds_path, sep="\t", index=False)
     preds_summary.to_csv(preds_summary_path, sep="\t", index=False)
-    stability.to_csv(stability_path, sep="	", index=False)
-stability.to_csv(stability_coef_path, sep="	", index=False)
+    stability.to_csv(stability_path, sep="\t", index=False)
+    stability.to_csv(stability_coef_path, sep="\t", index=False)
 
     with open(summary_path, "w") as f:
         f.write("Elastic Net Logistic Regression (glmnet-style) with repeated nested CV\n")
@@ -301,11 +301,10 @@ stability.to_csv(stability_coef_path, sep="	", index=False)
         f.write(f"  BalAcc : {overall_balacc:.4f}\n")
         f.write(f"  MCC : {overall_mcc:.4f}\n\n")
 
-        f.write("Top stable markers (first 20 OGs):
-")
-cols = ["Orthogroup","n_selected","selection_rate","mean_coef_selected","pos_rate_selected","mean_abs_coef"]
-cols = [c for c in cols if c in stability.columns]
-f.write(stability[cols].head(20).to_string(index=False))
+        f.write("Top stable markers (first 20 OGs):\n")
+        cols = ["Orthogroup","n_selected","selection_rate","mean_coef_selected","pos_rate_selected","mean_abs_coef"]
+        cols = [c for c in cols if c in stability.columns]
+        f.write(stability[cols].head(20).to_string(index=False))
         f.write("\n")
 
     print(f"[Done] Saved outputs to: {args.outdir}")
@@ -313,7 +312,7 @@ f.write(stability[cols].head(20).to_string(index=False))
     print(f"Overall AUC (avg probs): {overall_auc:.4f}")
     print(f"Summary: {summary_path}")
     print(f"Marker stability: {stability_path}")
-print(f"Marker stability with coef: {stability_coef_path}")
+    print(f"Marker stability with coef: {stability_coef_path}")
 
 
 if __name__ == "__main__":
