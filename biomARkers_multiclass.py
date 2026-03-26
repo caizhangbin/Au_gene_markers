@@ -8,6 +8,10 @@ import pandas as pd
 
 import ast
 import numpy as np
+import glob
+from ast import literal_eval
+from mlxtend.preprocessing import TransactionEncoder
+from mlxtend.frequent_patterns import association_rules, fpgrowth
 
 
 def _safe_rule_ogs(df):
@@ -176,26 +180,200 @@ try:
 except ModuleNotFoundError:
     from rfbiomarker_multiclass import RFBiomarkers, write_log, write_params, timefmt, save_models
 
-# Capture the exact important feature lists used inside get_rules() so exported
-# tables match the logged counts from the original workflow.
-_original_get_rules = RFBiomarkers.get_rules
+# Override get_rules so we export the exact clust_cols lists actually used
+# inside the original workflow, rather than reconstructing them later from p-values.
+def _wrapped_get_rules(self, pvalue=0.001, min_support=0.6, min_lift=1.5, non_lift=1.2, min_conf=0.8, 
+                  min_zhang=0.5, min_lev=0.05, min_conv=1.5, fpg_file=None, subsample=False):
+    wrt_str = [f'\nMinimum thresholds for frequent patterns and association rules:\n',
+               f'Max cluster importance p-value: {pvalue}\n',
+               f'Minimum support: {min_support}\n',
+               f'Minimum lift: {min_lift} (nonTarget lift: {non_lift})\n',
+               f'Minimum confidence: {min_conf}\n',
+               f'Minimum leverage: {min_lev}\n',
+               f"Minimum threshold for Zhang's metric: {min_zhang}\n"]
+    write_log(self.write, self.log_file, wrt_str)
 
-def _wrapped_get_rules(self, *args, **kwargs):
-    pvalue = kwargs.get('pvalue', args[0] if len(args) >= 1 else 0.001)
-    try:
-        coi = self.clust[1]
-        pval_df = self.fgc.p_value_of_features_per_cluster
-        self._exact_target_important_features = list(
-            pval_df[pval_df[coi] <= pvalue].index.to_list()
-        )
-        non_df = pval_df.drop(columns=coi)
-        self._exact_non_target_important_features = list(
-            non_df[non_df.astype(float).le(pvalue).any(axis=1)].index.to_list()
-        )
-    except Exception:
-        self._exact_target_important_features = []
-        self._exact_non_target_important_features = []
-    return _original_get_rules(self, *args, **kwargs)
+    def _get_features_df(target, min_lift, fpg_file=fpg_file, pvalue=pvalue, min_support=min_support, 
+                         min_conf=min_conf, min_zhang=min_zhang, min_lev=min_lev, min_conv=min_conv, subsample=subsample):
+        if target:
+            all_target_df = self.fgc.data_clustering_ranked[(self.fgc.data_clustering_ranked['cluster'] == self.clust[1]) & 
+                                                            (self.fgc.data_clustering_ranked['target'] == self.toi)]
+            tgt = f'Target ({self.toi})'
+            if fpg_file:
+                if glob.glob(f'{self.outdir}/{self.fileID}Target_FPG.tsv*'):
+                    fpg_file = glob.glob(f'{self.outdir}/{self.fileID}Target_FPG.tsv*')[0]
+            clust_list = self.fgc.p_value_of_features_per_cluster[self.fgc.p_value_of_features_per_cluster[self.clust[1]] <= pvalue].index.to_list()
+        else:
+            all_target_df = self.fgc.data_clustering_ranked[(self.fgc.data_clustering_ranked['cluster'] != self.clust[1]) & 
+                                                            (self.fgc.data_clustering_ranked['target'] != self.toi)]
+            non_df = self.fgc.p_value_of_features_per_cluster.drop(columns=self.clust[1])
+            tgt = f'nonTarget ({" ".join([c for c in list(set(self.y)) if c != self.toi])})'
+            if fpg_file:
+                if glob.glob(f'{self.outdir}/{self.fileID}nonTarget_FPG.tsv*'):
+                    fpg_file = glob.glob(f'{self.outdir}/{self.fileID}nonTarget_FPG.tsv*')[0]
+            clust_list = non_df[non_df.astype(float).le(pvalue).any(axis=1)].index.to_list()
+
+        if isinstance(clust_list, str):
+            clust_cols = [clust_list]
+        else:
+            clust_cols = list(clust_list)
+
+        # Store the exact feature lists used by the original workflow/log output
+        if target:
+            self._exact_target_important_features = list(clust_cols)
+        else:
+            self._exact_non_target_important_features = list(clust_cols)
+
+        if all_target_df is None or all_target_df.shape[0] == 0:
+            wrt_str = (
+                f"\n[{timefmt()}] WARNING: No samples found for {tgt}. "
+                f"Skipping frequent pattern mining and association rules for this subset.\n"
+            )
+            write_log(self.write, self.log_file, wrt_str)
+            empty_rules = pd.DataFrame(
+                columns=[
+                    'orthogroups', 'num_orthogroups', 'support', 'confidence',
+                    'lift', 'leverage', 'conviction', 'zhangs_metric'
+                ]
+            )
+            if target:
+                self.target_rules = empty_rules
+            else:
+                self.non_target_rules = empty_rules
+            return
+
+        if clust_cols is None or len(clust_cols) == 0:
+            wrt_str = (
+                f"\n[{timefmt()}] WARNING: No important features passed the p-value filter "
+                f"for {tgt}. Skipping frequent pattern mining and association rules for this subset.\n"
+            )
+            write_log(self.write, self.log_file, wrt_str)
+            empty_rules = pd.DataFrame(
+                columns=[
+                    'orthogroups', 'num_orthogroups', 'support', 'confidence',
+                    'lift', 'leverage', 'conviction', 'zhangs_metric'
+                ]
+            )
+            if target:
+                self.target_rules = empty_rules
+            else:
+                self.non_target_rules = empty_rules
+            return
+
+        clust_df = all_target_df[clust_cols].astype(int).replace({1: True, 0: False})
+        all_target_df = None
+
+        names_df = clust_df.apply(lambda x: np.where(x, x.name, None))
+        wrt_str = [f'\n[{timefmt()}] Identifying frequent patterns for {tgt}...\n',
+                   f'Number of samples used: {names_df.shape[0]}\n',
+                   f'Number of important features: {names_df.shape[1]}\n',
+                   f'\t{clust_cols}\n']
+        write_log(self.write, self.log_file, wrt_str)
+
+        if subsample:
+            names_df = clust_df.apply(lambda x: np.where(x, x.name, None)).sample(frac=0.5, axis=1, ignore_index=True)
+            wrt_str = f'\tNumber subsampled: {names_df.shape[1]}\n'
+            write_log(self.write, self.log_file, wrt_str)
+
+        lst = []
+        for sublist in names_df.values.tolist():
+            clean_sublist = [item for item in sublist if item is not None]
+            lst.append(clean_sublist)
+        names_df = None
+
+        if (lst is None) or (len(lst) == 0) or (sum(len(x) for x in lst) == 0):
+            wrt_str = (
+                f"\n[{timefmt()}] WARNING: No items available to encode for {tgt}. "
+                f"Skipping frequent pattern mining and association rules for this subset.\n"
+            )
+            write_log(self.write, self.log_file, wrt_str)
+            empty_rules = pd.DataFrame(
+                columns=[
+                    'orthogroups', 'num_orthogroups', 'support', 'confidence',
+                    'lift', 'leverage', 'conviction', 'zhangs_metric'
+                ]
+            )
+            if target:
+                self.target_rules = empty_rules
+            else:
+                self.non_target_rules = empty_rules
+            return
+
+        te = TransactionEncoder()
+        te.fit(lst)
+        te_ary = te.transform(lst, sparse=True)
+        sprs_df = pd.DataFrame.sparse.from_spmatrix(te_ary, columns=te.columns_)
+
+        clean_sublist = None
+        lst = None
+        te = None
+        te_ary = None
+
+        if not fpg_file:
+            fpg_file = Path(f'{self.outdir}/{self.fileID}{tgt.split(" ")[0]}_FPG.tsv')
+            fpg_df = fpgrowth(sprs_df, min_support=min_support, use_colnames=True, max_len=self.max_biomk+1)
+            fpg_df['itemsets'] = fpg_df['itemsets'].apply(lambda x: list(x) if pd.notna else list())
+            fpg_df.sort_values('support', ascending=False).to_csv(fpg_file, sep='\t', index=False)
+        else:
+            fpg_df = pd.read_csv(fpg_file, sep='\t')
+            fpg_df['itemsets'] = fpg_df['itemsets'].apply(literal_eval)
+            wrt_str = f'Using file {str(Path(fpg_file))} for frequent patterns dataset\n'
+            write_log(self.write, self.log_file, wrt_str)
+        sprs_df = None
+
+        wrt_str = [f'\tNumber of frequent patterns for {tgt}: {fpg_df.shape[0]}\n',
+                   f'\n[{timefmt()}] Generating association rules for {tgt}...\n']
+        write_log(self.write, self.log_file, wrt_str)
+        if fpg_df.empty:
+            wrt_str = f'\n[{timefmt()}] No frequent itemsets found; skipping association rules.\n'
+            write_log(self.write, self.log_file, wrt_str)
+            fpg_rules_df = pd.DataFrame(columns=['antecedents','consequents','support','confidence','lift','leverage','conviction','zhangs_metric'])
+        else:
+            fpg_rules_df = association_rules(fpg_df, metric="confidence", min_threshold=min_conf)
+
+        fpgrules_file = Path(f'{self.outdir}/{self.fileID}{tgt.split(" ")[0]}_FPG_rules.tsv')
+        fpg_columns = ['antecedents', 'consequents', 'support', 'confidence', 'lift', 'leverage', 'conviction', 'zhangs_metric']
+        fpg_rules_df = fpg_rules_df[[c for c in fpg_columns if c in fpg_rules_df.columns]]
+
+        wrt_str = [f'\tNumber of association rules for {tgt}: {fpg_rules_df.shape[0]}\n',
+                   f'\nMax calculated metrics values:\n{fpg_rules_df[fpg_columns].max(numeric_only=True)}\n',
+                   f'\nMin calculated metrics values:\n{fpg_rules_df[fpg_columns].min(numeric_only=True)}\n']
+        write_log(self.write, self.log_file, wrt_str)
+
+        fpg_df = None
+        wrt_str = f'\n[{timefmt()}] Inititial filtering of association rules for {tgt} (min lift = {min_lift})...\n'
+        write_log(self.write, self.log_file, wrt_str)
+        fpg_rules_df = fpg_rules_df[(fpg_rules_df['lift'] >= min_lift) &
+                                    ((fpg_rules_df['conviction'] == 'inf') | (fpg_rules_df['conviction'] >= min_conv)) &
+                                    (fpg_rules_df['zhangs_metric'] >= min_zhang)].round(
+                                        {c:4 for c in ['support', 'confidence', 'lift', 'leverage', 'conviction', 'zhangs_metric']})
+        wrt_str = f'\tNumber of association rules for {tgt} after filtering: {fpg_rules_df.shape[0]}\n'
+        write_log(self.write, self.log_file, wrt_str)
+
+        fpg_rules_df['orthogroups'] = [sorted(frozenset.union(*X)) for X in fpg_rules_df[['antecedents', 'consequents']].values]
+        fpg_rules_df['num_orthogroups'] = fpg_rules_df['orthogroups'].apply(lambda x: len(x))
+        fpg_rules_df['orthogroups'] = fpg_rules_df['orthogroups'].apply(lambda x: str(x))
+        fpg_columns = ['orthogroups', 'num_orthogroups', 'support', 'confidence', 'lift', 'leverage', 'conviction', 'zhangs_metric']
+        fpg_rules_df = fpg_rules_df[fpg_columns]
+
+        subset_cols = ['orthogroups', 'support', 'lift']
+        fpg_rules_df.drop_duplicates(subset=[c for c in subset_cols if c in fpg_rules_df.columns], ignore_index=True, keep='first', inplace=True)
+        wrt_str = f'\tNumber of association rules for {tgt} after removing duplicates: {fpg_rules_df.shape[0]}\n'
+        write_log(self.write, self.log_file, wrt_str)
+
+        fpg_rules_df.to_csv(fpgrules_file, sep='\t', index=False)
+        wrt_str = [f'All frequent patterns for {tgt} saved to: {fpg_file}\n',
+                   f'Filtered association rules for {tgt} saved to: {fpgrules_file}\n']
+        write_log(self.write, self.log_file, wrt_str)
+        if target:
+            self.target_rules = fpg_rules_df
+        else:
+            self.non_target_rules = fpg_rules_df
+        return
+
+    _get_features_df(target=True, min_lift=min_lift, fpg_file=fpg_file)
+    _get_features_df(target=False, min_lift=non_lift, fpg_file=fpg_file)
+    return
 
 RFBiomarkers.get_rules = _wrapped_get_rules
 
