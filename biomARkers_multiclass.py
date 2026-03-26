@@ -50,9 +50,9 @@ def export_rf_summary_reports(rfcls, outdir, fileID, pval, annot_file=None):
         merged = meta.merge(base_reset, on=rfcls.id_col, how='left')
 
         coi = rfcls.clust[1] if hasattr(rfcls, 'clust') else None
-        target_important = set()
-        non_target_important = set()
-        if coi is not None and coi in pval_df.columns:
+        target_important = set(getattr(rfcls, '_exact_target_important_features', []) or [])
+        non_target_important = set(getattr(rfcls, '_exact_non_target_important_features', []) or [])
+        if (not target_important and not non_target_important) and coi is not None and coi in pval_df.columns:
             target_important = set(pval_df.index[pval_df[coi] <= pval].tolist())
             non_df = pval_df.drop(columns=coi)
             if non_df.shape[1] > 0:
@@ -175,6 +175,29 @@ try:
     from rfbiomarker import RFBiomarkers, write_log, write_params, timefmt, save_models
 except ModuleNotFoundError:
     from rfbiomarker_multiclass import RFBiomarkers, write_log, write_params, timefmt, save_models
+
+# Capture the exact important feature lists used inside get_rules() so exported
+# tables match the logged counts from the original workflow.
+_original_get_rules = RFBiomarkers.get_rules
+
+def _wrapped_get_rules(self, *args, **kwargs):
+    pvalue = kwargs.get('pvalue', args[0] if len(args) >= 1 else 0.001)
+    try:
+        coi = self.clust[1]
+        pval_df = self.fgc.p_value_of_features_per_cluster
+        self._exact_target_important_features = list(
+            pval_df[pval_df[coi] <= pvalue].index.to_list()
+        )
+        non_df = pval_df.drop(columns=coi)
+        self._exact_non_target_important_features = list(
+            non_df[non_df.astype(float).le(pvalue).any(axis=1)].index.to_list()
+        )
+    except Exception:
+        self._exact_target_important_features = []
+        self._exact_non_target_important_features = []
+    return _original_get_rules(self, *args, **kwargs)
+
+RFBiomarkers.get_rules = _wrapped_get_rules
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(usage='%(prog)s [-h] -i INPUT -o DIR -c COLUMN -t TARGET [-d -f -r -p -v -w --min --max --test_size --seeds --force --unsup]', 
