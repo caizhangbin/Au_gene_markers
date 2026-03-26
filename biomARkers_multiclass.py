@@ -6,6 +6,169 @@ import joblib
 from time import localtime, strftime
 import pandas as pd 
 
+import ast
+import numpy as np
+
+
+def _safe_rule_ogs(df):
+    """Return a sorted list of orthogroups present in a rules dataframe."""
+    if df is None or getattr(df, 'empty', True) or 'orthogroups' not in df.columns:
+        return []
+    vals = []
+    for item in df['orthogroups'].tolist():
+        if isinstance(item, list):
+            vals.extend(item)
+        elif isinstance(item, str):
+            try:
+                parsed = ast.literal_eval(item)
+                if isinstance(parsed, list):
+                    vals.extend(parsed)
+            except Exception:
+                continue
+    return sorted(set(vals))
+
+
+def export_rf_summary_reports(rfcls, outdir, fileID, pval, annot_file=None):
+    """Write manuscript-friendly RF summary tables for downstream supplement use."""
+    try:
+        if not hasattr(rfcls, 'fgc') or not hasattr(rfcls.fgc, 'p_value_of_features_per_cluster'):
+            return
+
+        outdir = Path(outdir)
+        pval_df = rfcls.fgc.p_value_of_features_per_cluster.copy()
+        pval_df.index.name = 'Orthogroup'
+        pval_wide = pval_df.reset_index()
+        pval_wide.to_csv(outdir / f'{fileID}RF_cluster_pvalues.tsv', sep='	', index=False)
+
+        feature_cols = [c for c in rfcls.predictors if c in rfcls.data.columns]
+        base = rfcls.data[feature_cols].copy()
+        base.index.name = rfcls.id_col
+        base_reset = base.reset_index()
+
+        meta = rfcls.isolate_clust.copy()
+        meta.columns = [rfcls.id_col, 'target', 'rf_cluster']
+        merged = meta.merge(base_reset, on=rfcls.id_col, how='left')
+
+        coi = rfcls.clust[1] if hasattr(rfcls, 'clust') else None
+        target_important = set()
+        non_target_important = set()
+        if coi is not None and coi in pval_df.columns:
+            target_important = set(pval_df.index[pval_df[coi] <= pval].tolist())
+            non_df = pval_df.drop(columns=coi)
+            if non_df.shape[1] > 0:
+                non_target_important = set(non_df.index[non_df.astype(float).le(pval).any(axis=1)].tolist())
+
+        target_rule_ogs = set(_safe_rule_ogs(getattr(rfcls, 'target_rules', None)))
+        non_target_rule_ogs = set(_safe_rule_ogs(getattr(rfcls, 'non_target_rules', None)))
+        final_target_biomarkers = set(getattr(rfcls, 'final_feat', []) or [])
+
+        summary = pd.DataFrame({'Orthogroup': sorted(set(feature_cols) | set(pval_df.index))})
+        if coi is not None:
+            summary['cluster_of_interest'] = coi
+            summary['is_target_important'] = summary['Orthogroup'].isin(target_important)
+            summary['is_non_target_important'] = summary['Orthogroup'].isin(non_target_important)
+            summary['in_target_rules'] = summary['Orthogroup'].isin(target_rule_ogs)
+            summary['in_non_target_rules'] = summary['Orthogroup'].isin(non_target_rule_ogs)
+            summary['final_target_biomarker'] = summary['Orthogroup'].isin(final_target_biomarkers)
+
+        # merge cluster p values
+        pval_cols = []
+        for col in pval_df.columns:
+            new_col = f'rf_cluster_{col}_pvalue'
+            pval_cols.append(new_col)
+            tmp = pval_df[[col]].rename(columns={col: new_col}).reset_index()
+            summary = summary.merge(tmp, on='Orthogroup', how='left')
+
+        # prevalence by target group
+        target_levels = list(pd.unique(merged['target']))
+        for level in target_levels:
+            sub = merged[merged['target'] == level]
+            n = sub.shape[0]
+            if n == 0:
+                continue
+            counts = sub[feature_cols].sum(axis=0)
+            prev = counts / n
+            tmp = pd.DataFrame({
+                'Orthogroup': feature_cols,
+                f'count_target_{level}': counts.values,
+                f'prevalence_target_{level}': prev.values,
+            })
+            summary = summary.merge(tmp, on='Orthogroup', how='left')
+
+        # prevalence by RF cluster
+        for cluster in sorted(pd.unique(merged['rf_cluster'])):
+            sub = merged[merged['rf_cluster'] == cluster]
+            n = sub.shape[0]
+            if n == 0:
+                continue
+            counts = sub[feature_cols].sum(axis=0)
+            prev = counts / n
+            tmp = pd.DataFrame({
+                'Orthogroup': feature_cols,
+                f'count_rfcluster_{cluster}': counts.values,
+                f'prevalence_rfcluster_{cluster}': prev.values,
+            })
+            summary = summary.merge(tmp, on='Orthogroup', how='left')
+
+        # prevalence in target subset used for target-rule mining
+        if coi is not None:
+            subset_target = merged[(merged['rf_cluster'] == coi) & (merged['target'] == rfcls.toi)]
+            subset_nontarget = merged[(merged['rf_cluster'] != coi) & (merged['target'] != rfcls.toi)]
+            for label, sub in [('target_subset', subset_target), ('non_target_subset', subset_nontarget)]:
+                n = sub.shape[0]
+                if n == 0:
+                    continue
+                counts = sub[feature_cols].sum(axis=0)
+                prev = counts / n
+                tmp = pd.DataFrame({
+                    'Orthogroup': feature_cols,
+                    f'count_{label}': counts.values,
+                    f'prevalence_{label}': prev.values,
+                })
+                summary = summary.merge(tmp, on='Orthogroup', how='left')
+
+        # optional annotation merge
+        if annot_file and Path(annot_file).is_file():
+            try:
+                annot_df = pd.read_csv(annot_file, sep='	')
+                if 'Orthogroup' in annot_df.columns:
+                    keep = [c for c in ['Orthogroup', 'Annotation(s)', 'Annotation', 'Gene', 'Description'] if c in annot_df.columns]
+                    annot_df = annot_df[keep].drop_duplicates()
+                    summary = summary.merge(annot_df, on='Orthogroup', how='left')
+            except Exception:
+                pass
+
+        # Order columns for easier supplement use
+        first_cols = ['Orthogroup']
+        preferred = [
+            'cluster_of_interest', 'is_target_important', 'is_non_target_important',
+            'in_target_rules', 'in_non_target_rules', 'final_target_biomarker'
+        ]
+        first_cols.extend([c for c in preferred if c in summary.columns])
+        first_cols.extend([c for c in pval_cols if c in summary.columns])
+        remaining = [c for c in summary.columns if c not in first_cols]
+        summary = summary[first_cols + remaining]
+
+        summary.to_csv(outdir / f'{fileID}RF_feature_summary.tsv', sep='	', index=False)
+
+        # concise manuscript-ready subset tables
+        summary[summary.get('is_target_important', False) == True].to_csv(
+            outdir / f'{fileID}RF_target_important_features.tsv', sep='	', index=False
+        )
+        summary[summary.get('is_non_target_important', False) == True].to_csv(
+            outdir / f'{fileID}RF_nonTarget_important_features.tsv', sep='	', index=False
+        )
+        summary[summary.get('final_target_biomarker', False) == True].to_csv(
+            outdir / f'{fileID}RF_final_target_biomarkers.tsv', sep='	', index=False
+        )
+    except Exception as e:
+        try:
+            write_log(getattr(rfcls, 'write', 'default'), getattr(rfcls, 'log_file', ''),
+                      f'\nWarning: could not write RF summary tables: {e}\n')
+        except Exception:
+            pass
+
+
 # Support importing either the original rfbiomarker module name or the updated
 # multiclass-compatible version (keeps CLI behavior unchanged).
 try:
@@ -259,6 +422,8 @@ if __name__ == '__main__':
                 annots_df = rfcls.get_annotions(annot_file)
                 annots_df.to_csv(f'{Path(outdir, Path(annot_file).stem)}.orthog_gene_names.tsv', 
                                  sep='\t', index=False)
+
+        export_rf_summary_reports(rfcls, outdir, fileID, pval=args.pval, annot_file=args.annot_file)
 
         if args.save_models:
             wrt_str = save_models(rfcls, 'rfbio')
